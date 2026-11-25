@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  convert-video — Batch Video Converter for DaVinci Resolve on Linux
+#  Converts any FFmpeg-readable video into Resolve-native DNxHR LB .mov files
+#  with PCM s16le audio at 48 kHz.
+#
+#  References:
+#    https://christitus.com/resolve-in-arch-linux/#the-codec-problem
+#    https://github.com/ChrisTitusTech/resolve-linux
+#    https://github.com/EdvinNilsson/ffmpeg_encoder_plugin
+#
+#  Usage:
+#    convert-video [OPTIONS] file1 [file2 ...]
+#
+#  Options:
+#    -f, --force       Overwrite existing output files without prompting
+#    -q, --quality     DNxHR profile: lb (default), sq, hq, hqx, 444
+#    -h, --help        Show this help message
+# =============================================================================
+
+set -euo pipefail
+
+# ─────────────────────────── Colour / Style ──────────────────────────────────
+# Detect colour support
+if [[ -t 1 ]] && command -v tput &>/dev/null && tput colors &>/dev/null \
+        && [[ "$(tput colors)" -ge 8 ]]; then
+    BOLD=$(tput bold)
+    RESET=$(tput sgr0)
+    RED=$(tput setaf 1)
+    GREEN=$(tput setaf 2)
+    YELLOW=$(tput setaf 3)
+    CYAN=$(tput setaf 6)
+    MAGENTA=$(tput setaf 5)
+    DIM=$(tput dim 2>/dev/null || printf '')
+else
+    BOLD='' RESET='' RED='' GREEN='' YELLOW='' CYAN='' MAGENTA='' DIM=''
+fi
+
+# ─────────────────────────── Helper functions ─────────────────────────────────
+print_banner() {
+    printf '%s\n' "${CYAN}${BOLD}"
+    printf '  ╔══════════════════════════════════════════════════════╗\n'
+    printf '  ║      convert-video — DaVinci Resolve Converter       ║\n'
+    printf '  ║   DNxHR LB · MOV · PCM s16le · 48 kHz · yuv422p     ║\n'
+    printf '  ╚══════════════════════════════════════════════════════╝\n'
+    printf '%s\n' "${RESET}"
+}
+
+log_info()    { printf '%s[INFO]%s  %s\n'    "${CYAN}"    "${RESET}" "$*"; }
+log_ok()      { printf '%s[OK]%s    %s\n'    "${GREEN}"   "${RESET}" "$*"; }
+log_warn()    { printf '%s[WARN]%s  %s\n'    "${YELLOW}"  "${RESET}" "$*" >&2; }
+log_error()   { printf '%s[ERROR]%s %s\n'    "${RED}"     "${RESET}" "$*" >&2; }
+log_step()    { printf '%s  ▶%s %s\n'        "${MAGENTA}" "${RESET}" "$*"; }
+log_detail()  { printf '%s    %s%s\n'        "${DIM}"     "$*" "${RESET}"; }
+log_sep()     { printf '%s%s%s\n' "${CYAN}${DIM}" \
+                       '────────────────────────────────────────────────────' \
+                       "${RESET}"; }
+
+# ─────────────────────────── Usage / Help ─────────────────────────────────────
+usage() {
+    cat <<EOF
+${BOLD}USAGE${RESET}
+    convert-video [OPTIONS] <file1> [file2 ...]
+
+${BOLD}DESCRIPTION${RESET}
+    Converts video files to DaVinci Resolve-compatible DNxHR LB .mov format.
+    Preserves original resolution, frame rate, and channel layout.
+    Output files are placed next to the originals with "_resolve" appended.
+
+      recording.mp4   →   recording_resolve.mov
+      lecture.mkv     →   lecture_resolve.mov
+
+${BOLD}OPTIONS${RESET}
+    -f, --force           Overwrite existing output files without prompting
+    -q, --quality LEVEL   DNxHR quality profile (default: lb)
+                            lb   — Low Bandwidth   (~36 Mbps @ 1080p)
+                            sq   — Standard Quality (~115 Mbps @ 1080p)
+                            hq   — High Quality    (~175 Mbps @ 1080p)
+                            hqx  — High Quality 12-bit  (~440 Mbps @ 1080p)
+                            444  — 4:4:4 High Quality 12-bit
+    -h, --help            Show this help message
+
+${BOLD}EXAMPLES${RESET}
+    convert-video recording.mp4
+    convert-video recording1.mp4 recording2.mkv "my lecture.mov"
+    convert-video --force --quality sq *.mp4
+
+${BOLD}OUTPUT CODEC SPECS${RESET}
+    Container : MOV (QuickTime)
+    Video     : DNxHR LB (or chosen profile), yuv422p
+    Audio     : PCM signed 16-bit little-endian, 48000 Hz
+    Resolution: Preserved (original)
+    Frame rate: Preserved (original)
+
+${BOLD}REQUIREMENTS${RESET}
+    ffmpeg, ffprobe — install with: sudo pacman -S ffmpeg
+EOF
+}
+
+# ─────────────────────────── Dependency check ────────────────────────────────
+check_deps() {
+    local missing=()
+    for cmd in ffmpeg ffprobe; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing required tools: ${missing[*]}"
+        log_error "Install them on Arch Linux with: sudo pacman -S ffmpeg"
+        exit 1
+    fi
+
+    # Verify ffmpeg has DNxHD/DNxHR encoder compiled in
+    # Note: ffmpeg exits with code 1 when listing encoders (no output file),
+    # so we use || true to prevent pipefail from triggering a false negative.
+    local enc_list
+    enc_list="$(ffmpeg -encoders 2>/dev/null || true)"
+    if ! printf '%s' "$enc_list" | grep -q 'dnxhd'; then
+        log_error "Your ffmpeg build does not include the DNxHD/DNxHR encoder."
+        log_error "Reinstall ffmpeg: sudo pacman -S ffmpeg"
+        exit 1
+    fi
+}
+
+# ─────────────────────────── Profile → pixel-format map ──────────────────────
+# DNxHR 444 requires yuv444p; all others use yuv422p
+profile_to_pixfmt() {
+    case "$1" in
+        444) echo "yuv444p" ;;
+        *)   echo "yuv422p" ;;
+    esac
+}
+
+# ─────────────────────────── Output filename builder ─────────────────────────
+# Given /path/to/recording.mp4  →  /path/to/recording_resolve.mov
+build_output_path() {
+    local input="$1"
+    local dir base stem
+    dir="$(dirname "$input")"
+    base="$(basename "$input")"
+    stem="${base%.*}"   # strip extension
+    echo "${dir}/${stem}_resolve.mov"
+}
+
+# ─────────────────────────── Single-file conversion ──────────────────────────
+convert_file() {
+    local input="$1"
+    local profile="$2"
+    local force="$3"
+
+    local output
+    output="$(build_output_path "$input")"
+
+    log_sep
+    log_step "Input : ${BOLD}${input}${RESET}"
+    log_step "Output: ${BOLD}${output}${RESET}"
+
+    # ── Validate input ────────────────────────────────────────────────────────
+    if [[ ! -f "$input" ]]; then
+        log_error "File not found: $input"
+        return 1
+    fi
+
+    if [[ ! -r "$input" ]]; then
+        log_error "File not readable: $input"
+        return 1
+    fi
+
+    # ── Probe input with ffprobe ──────────────────────────────────────────────
+    local probe_json
+    if ! probe_json="$(ffprobe -v quiet -print_format json -show_streams \
+                       -show_format "$input" 2>&1)"; then
+        log_error "ffprobe could not read: $input"
+        log_detail "Make sure the file is a valid video and not corrupted."
+        return 1
+    fi
+
+    # Extract key metadata (best-effort; ffprobe JSON output)
+    local video_codec audio_codec width height r_frame_rate channels
+    video_codec="$(printf '%s' "$probe_json" \
+        | grep -m1 '"codec_type": "video"' -A2 \
+        | grep '"codec_name"' | sed 's/.*: "//;s/".*//')"
+    audio_codec="$(printf '%s' "$probe_json" \
+        | grep -m1 '"codec_type": "audio"' -A2 \
+        | grep '"codec_name"' | sed 's/.*: "//;s/".*//')"
+    width="$(printf '%s' "$probe_json" \
+        | grep -m1 '"width":' | sed 's/[^0-9]//g')"
+    height="$(printf '%s' "$probe_json" \
+        | grep -m1 '"height":' | sed 's/[^0-9]//g')"
+    r_frame_rate="$(printf '%s' "$probe_json" \
+        | grep -m1 '"r_frame_rate"' | sed 's/.*: "//;s/".*//')"
+    channels="$(printf '%s' "$probe_json" \
+        | grep -m1 '"channels":' | sed 's/[^0-9]//g')"
+
+    # Friendly fps display
+    local fps_display="$r_frame_rate"
+    if [[ "$r_frame_rate" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+        local num="${BASH_REMATCH[1]}" den="${BASH_REMATCH[2]}"
+        if (( den > 0 )); then
+            fps_display="$(awk "BEGIN{printf \"%.3f\", $num/$den}")"
+        fi
+    fi
+
+    log_detail "Video codec : ${video_codec:-unknown}"
+    log_detail "Audio codec : ${audio_codec:-none}"
+    log_detail "Resolution  : ${width:-?}×${height:-?}"
+    log_detail "Frame rate  : ${fps_display} fps"
+    log_detail "Channels    : ${channels:-?}"
+
+    # ── Decide audio handling ─────────────────────────────────────────────────
+    # Has audio stream?
+    local has_audio=false
+    if printf '%s' "$probe_json" | grep -q '"codec_type": "audio"'; then
+        has_audio=true
+    fi
+
+    # ── Check output file already exists ─────────────────────────────────────
+    if [[ -f "$output" ]]; then
+        if [[ "$force" == "true" ]]; then
+            log_warn "Output exists; overwriting (--force active): $output"
+        else
+            log_warn "Output already exists: $output"
+            printf '    %sOverwrite? [y/N]%s ' "${YELLOW}" "${RESET}"
+            local ans
+            read -r ans </dev/tty
+            if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+                log_info "Skipping: $input"
+                return 0
+            fi
+        fi
+    fi
+
+    # ── Determine pixel format ────────────────────────────────────────────────
+    local pixfmt
+    pixfmt="$(profile_to_pixfmt "$profile")"
+
+    # ── Build DNxHR profile string ────────────────────────────────────────────
+    local dnxhr_profile="dnxhr_${profile}"
+
+    # ── Determine channel layout flags ───────────────────────────────────────
+    # Resolve works best with stereo or the original layout preserved as PCM.
+    # We pass -ac only if there is exactly 1 channel (upmix mono → stereo for
+    # better Resolve compatibility), otherwise let ffmpeg copy the layout.
+    local audio_flags=()
+    if [[ "$has_audio" == "true" ]]; then
+        audio_flags+=( -c:a pcm_s16le -ar 48000 )
+        if [[ "${channels}" == "1" ]]; then
+            # Mono → stereo upmix for better Resolve compatibility
+            audio_flags+=( -ac 2 )
+            log_detail "Audio note  : Mono source → upmixed to stereo for Resolve"
+        fi
+    else
+        audio_flags+=( -an )
+        log_detail "Audio note  : No audio stream found, output will be video-only"
+    fi
+
+    # ── Build scale filter: DNxHR requires even dimensions ───────────────────
+    # Round width/height up to nearest even number if needed.
+    local vf_filter="scale=trunc(iw/2)*2:trunc(ih/2)*2"
+
+    # ── Run FFmpeg ────────────────────────────────────────────────────────────
+    log_info "Starting conversion  [DNxHR ${profile^^} · ${pixfmt} · PCM s16le 48kHz]"
+
+    local start_ts end_ts elapsed
+    start_ts=$(date +%s)
+
+    local ffmpeg_exit=0
+    ffmpeg \
+        -hide_banner \
+        -loglevel warning \
+        -stats \
+        -i "$input" \
+        -vf "$vf_filter" \
+        -c:v dnxhd \
+        -profile:v "$dnxhr_profile" \
+        -pix_fmt "$pixfmt" \
+        "${audio_flags[@]}" \
+        -movflags +faststart \
+        -y \
+        "$output" \
+        2>&1 || ffmpeg_exit=$?
+
+    end_ts=$(date +%s)
+    elapsed=$(( end_ts - start_ts ))
+
+    if [[ $ffmpeg_exit -ne 0 ]]; then
+        log_error "Conversion FAILED for: $input  (ffmpeg exit code: $ffmpeg_exit)"
+        # Remove incomplete output file if it was created
+        if [[ -f "$output" && ! -s "$output" ]]; then
+            rm -f "$output"
+        fi
+        return 1
+    fi
+
+    # ── Verify output was created and is non-empty ────────────────────────────
+    if [[ ! -f "$output" ]] || [[ ! -s "$output" ]]; then
+        log_error "Output file is missing or empty: $output"
+        return 1
+    fi
+
+    local out_size
+    out_size="$(du -sh "$output" 2>/dev/null | cut -f1)"
+    log_ok "Done in ${elapsed}s  →  ${output} (${out_size})"
+
+    return 0
+}
+
+# ─────────────────────────── Argument parsing ────────────────────────────────
+main() {
+    local force="false"
+    local quality="lb"
+    local files=()
+
+    # Valid quality profiles
+    local valid_profiles=("lb" "sq" "hq" "hqx" "444")
+
+    if [[ $# -eq 0 ]]; then
+        print_banner
+        usage
+        exit 0
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                print_banner
+                usage
+                exit 0
+                ;;
+            -f|--force)
+                force="true"
+                shift
+                ;;
+            -q|--quality)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--quality requires a value: lb, sq, hq, hqx, 444"
+                    exit 1
+                fi
+                quality="${2,,}"   # lowercase
+                shift 2
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                log_error "Run 'convert-video --help' for usage."
+                exit 1
+                ;;
+            *)
+                files+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Validate quality profile
+    local valid=false
+    for p in "${valid_profiles[@]}"; do
+        [[ "$quality" == "$p" ]] && valid=true && break
+    done
+    if [[ "$valid" != "true" ]]; then
+        log_error "Invalid quality profile: '$quality'"
+        log_error "Valid choices: ${valid_profiles[*]}"
+        exit 1
+    fi
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        log_error "No input files specified."
+        log_error "Run 'convert-video --help' for usage."
+        exit 1
+    fi
+
+    # ── Print banner & check deps ─────────────────────────────────────────────
+    print_banner
+    check_deps
+
+    local total=${#files[@]}
+    local passed=0
+    local failed=0
+    local failed_files=()
+
+    log_info "Files to convert : ${total}"
+    log_info "DNxHR profile    : ${quality^^}"
+    log_info "Pixel format     : $(profile_to_pixfmt "$quality")"
+    log_info "Audio            : PCM s16le · 48000 Hz"
+    log_info "Force overwrite  : ${force}"
+
+    # ── Process each file ─────────────────────────────────────────────────────
+    local idx=0
+    for file in "${files[@]}"; do
+        idx=$(( idx + 1 ))
+        printf '\n'
+        log_info "[ ${idx} / ${total} ] Processing: $(basename "$file")"
+
+        if convert_file "$file" "$quality" "$force"; then
+            passed=$(( passed + 1 ))
+        else
+            failed=$(( failed + 1 ))
+            failed_files+=("$file")
+        fi
+    done
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    log_sep
+    printf '\n'
+    log_info "${BOLD}Summary${RESET}"
+    log_info "  Total    : ${total}"
+    log_ok   "  Success  : ${passed}"
+
+    if [[ $failed -gt 0 ]]; then
+        log_error "  Failed   : ${failed}"
+        log_error "  Failed files:"
+        for f in "${failed_files[@]}"; do
+            log_error "    - $f"
+        done
+        log_sep
+        exit 1
+    else
+        log_ok "All conversions completed successfully."
+        log_sep
+        exit 0
+    fi
+}
+
+main "$@"
