@@ -1,6 +1,5 @@
-# Davinchi-codec-resolver
+# codec-resolver — Universal Guide
 
-codec-resolver — Universal Guide
 Batch Video Converter for DaVinci Resolve on Linux
 Who this is for: Anyone running DaVinci Resolve on Linux who gets "Media Offline", silent audio, or missing video when importing H.264/H.265/AAC footage. This guide works on any Linux distribution.
 
